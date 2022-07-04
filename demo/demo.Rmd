@@ -1,0 +1,201 @@
+---
+title: "Demo"
+author: "jcleng"
+date: '2022-07-03'
+output:
+  html_document: default
+  pdf_document: default
+---
+
+#### loading data
+
+```{r}
+library(Seurat)
+library(SeuratData)
+Sys.setlocale(category = "LC_ALL", locale = "us")
+InstallData("pbmc3k")
+pbmc <- LoadData("pbmc3k", type = "pbmc3k.final")
+levels(pbmc)
+```
+
+#### choose two group you interest
+
+```{r}
+index <- ((pbmc$seurat_annotations=='FCGR3A+ Mono') | (pbmc$seurat_annotations=='CD14+ Mono'))
+pbmc_new <- pbmc[,index]
+```
+
+#### feature selection
+
+```{r}
+pbmc_new <- FindVariableFeatures(pbmc_new, selection.method = "vst", nfeatures = 500)
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(pbmc_new), 10)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(pbmc_new)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot2
+```
+
+#### imputation
+
+```{r}
+library(Rmagic)
+screen_matrix <- pbmc@assays$RNA@data
+print(sum(screen_matrix != 0) / length(screen_matrix))
+imputed_matrix <- t(as.matrix(magic(data = t(screen_matrix))$result))
+print(sum(imputed_matrix != 0) / length(imputed_matrix))
+```
+
+#### extract data
+
+```{r}
+feature_genes <- VariableFeatures(pbmc_new)
+tmp_seurat <- CreateSeuratObject(imputed_matrix[feature_genes, ])
+tmp_seurat <- ScaleData(tmp_seurat)
+final_matrix <- tmp_seurat@assays$RNA@data
+scale_matrix <- tmp_seurat@assays$RNA@scale.data # used for calculating network
+tmp_sampleids <- colnames(final_matrix)
+
+```
+
+#### create input of CDN
+
+```{r}
+K <- 1
+sample_ids <- colnames(screen_matrix)
+FCGR3A_index <- na.exclude(match(sample_ids[pbmc$seurat_annotations=='FCGR3A+ Mono'], sample_ids))
+CD14_index <- na.exclude(match(sample_ids[pbmc$seurat_annotations=='CD14+ Mono'], sample_ids))
+X <- matrix(list(), nrow = K, ncol = 2)
+X[[1, 1]] <- as.matrix(scale(t(scale_matrix[, FCGR3A_index])))
+X[[1, 2]] <- as.matrix(scale(t(scale_matrix[, CD14_index])))
+```
+
+#### run CDN
+
+```{r}
+source("./utils/keep.largest.N.R")
+source("./algorithms/CDN_fast.R")
+result_CDN <- CDN_fast(X, ifparallel = TRUE, err_threshold = 1e-5)
+delta_avg <- matrix(0, nrow = length(feature_genes), ncol = length(feature_genes))
+for (k in 1:K) {
+  delta_avg <- delta_avg + result_CDN$delta[k, , ]
+}
+delta_avg <- delta_avg / K
+rownames(delta_avg) <- colnames(delta_avg) <- rownames(final_matrix)
+delta_avg_CDN <- delta_avg
+
+
+```
+
+#### create sample list
+
+```{r}
+sample_list <- data.frame(id=colnames(pbmc_new),
+                          group=pbmc_new$seurat_annotations,
+                          label=plyr::mapvalues(pbmc_new$seurat_annotations,from=levels(pbmc_new),to=c(0,1)))
+sample_list$label <- as.numeric(as.character(sample_list$label))
+```
+
+#### Calculate pAPC2
+
+```{r}
+source("./utils/APC2_pivot.R")
+delta_avg_CDN500 <- keep.largest.N(delta_avg_CDN, 4000)
+sum(delta_avg_CDN500 != 0)/2 
+q <- 2000
+n <- dim(pbmc_new)[2]
+final_matrix_used <- final_matrix[,index]
+top500_index <- which(delta_avg_CDN500 != 0, arr.ind = T)
+# check if symmetric
+if (sum(top500_index[, 1] < top500_index[, 2]) == q) {
+  print("index is symmetric!")
+} else {
+  print("index is not symmetric!")
+}
+APC2_matrix <- matrix(nrow = q, ncol = n)
+colnames(APC2_matrix) <- colnames(pbmc_new)
+rownames(APC2_matrix) <- rep("", q)
+s <- 0
+pb <- txtProgressBar(style = 3)
+for (i in 1:dim(top500_index)[1]) {
+  if (top500_index[i, 1] < top500_index[i, 2]) {
+    s <- s + 1
+    matrix_tmp <- as.matrix(final_matrix_used[c(top500_index[i, 1], top500_index[i, 2]), ])
+    APC2_matrix[s, ] <- pivot_APC2(t(matrix_tmp), pivot = T, labels = sample_list$label)$APC2
+    rownames_tmp <- paste0(rownames(final_matrix_used)[top500_index[i, 1]], "~", rownames(final_matrix_used)[top500_index[i, 2]])
+    rownames(APC2_matrix)[s] <- rownames_tmp
+  }
+  setTxtProgressBar(pb, i / dim(top500_index)[1])
+}
+
+```
+
+#### gene umap
+
+```{r}
+library(Seurat)
+gene_seurat <- CreateSeuratObject(count = final_matrix_used, project = "genes with impute")
+gene_seurat <- ScaleData(gene_seurat)
+gene_seurat <- RunPCA(gene_seurat, features = rownames(gene_seurat))
+select_dim <- 5
+
+gene_seurat <- FindNeighbors(gene_seurat, dims = 1:select_dim, nn.method = "rann")
+gene_seurat <- FindClusters(gene_seurat, resolution = 0.2)
+gene_seurat <- RunUMAP(gene_seurat, dims = 1:select_dim)
+gene_seurat$group <- sample_list$group
+DimPlot(gene_seurat, reduction = "umap", label = T, label.size = 5, group.by = 'group') 
+```
+
+#### APC2 UMAP
+
+```{r}
+
+total_matrix <- rbind(final_matrix_used, APC2_matrix)
+total_seurat <- CreateSeuratObject(count = total_matrix, project = "Both interactions and genes")
+feature_interations <- rownames(APC2_matrix)
+feature_genes <- rownames(final_matrix_used)
+total_seurat <- ScaleData(total_seurat, features = feature_interations)
+total_seurat <- RunPCA(total_seurat, features = feature_interations)
+select_dim <- 5
+
+total_seurat <- FindNeighbors(total_seurat, dims = 1:select_dim, features = feature_interations, nn.method = "rann") # PCA dims
+total_seurat <- FindClusters(total_seurat, resolution = 0.2, features = feature_interations)
+total_seurat <- RunUMAP(total_seurat, dims = 1:select_dim)
+total_seurat$group <- sample_list$group
+DimPlot(total_seurat, reduction = "umap", label = T, label.size = 5, group.by = "group")
+
+```
+
+#### find markers
+
+```{r}
+total_seurat <- SetIdent(total_seurat, value = "group")
+cluster.markers.gene <- FindAllMarkers(total_seurat, features = feature_genes, test.use = "t", return.thresh = 1.1, only.pos = T, logfc.threshold = 0, min.pct = 0)
+cluster.markers.interations <- FindAllMarkers(total_seurat, features = feature_interations, test.use = "t", return.thresh = 1.1, only.pos = T, logfc.threshold = 0, min.pct = 0)
+cluster.markers.gene$p_val_adj <- p.adjust(cluster.markers.gene$p_val, method = "BH")
+cluster.markers.interations$p_val_adj <- p.adjust(cluster.markers.interations$p_val, method = "BH")
+cluster.markers.interations_screened <- cluster.markers.interations[cluster.markers.interations$p_val_adj <= 0.05 & cluster.markers.interations$avg_log2FC > .01, ]
+cluster.markers.gene_screeend <- cluster.markers.gene[cluster.markers.gene$p_val_adj <= 0.05 & cluster.markers.gene$avg_log2FC > .01, ]
+
+
+top_marker10.interactions <- dplyr::group_by(cluster.markers.interations_screened, cluster)
+top_marker10.interactions <- dplyr::slice_max(top_marker10.interactions, n = 10, order_by = (avg_log2FC), with_ties = FALSE)
+
+top_marker10.genes <- dplyr::group_by(cluster.markers.gene_screeend, cluster)
+top_marker10.genes <- dplyr::slice_max(top_marker10.genes, n = 10, order_by = (avg_log2FC), with_ties = FALSE)
+
+library(dittoSeq)
+dittoDotPlot(total_seurat, unique(top_marker10.interactions$gene), group.by = "group", main = "Top 10 markers of each group")
+dittoDotPlot(total_seurat, unique(top_marker10.genes$gene), group.by = "group", main = "Top 10 markers of each group")
+
+
+```
+
+#### feature visualization
+```{r}
+FeaturePlot(total_seurat,features = c('ANXA1~MALAT1'))
+FeatureScatter(total_seurat,'ANXA1','MALAT1')
+```
